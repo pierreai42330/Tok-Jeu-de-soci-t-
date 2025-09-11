@@ -3,16 +3,17 @@ import React, { useEffect, useMemo, useState } from "react";
 /**
  * Tok – prototype local (2v2) with optional bots
  * -------------------------------------------------
- * V3 – Sens de déplacement ANTihoraire (vers la gauche) après la sortie.
- *  - 4 humains par défaut (bots désactivés, bouton pour activer au besoin)
- *  - Choix manuel du passage secret quand on s'arrête sur une pointe
- *  - Indices de sortie réglables pour coller à ta planche (START_INDEXES)
- *  - Distribution: 5 cartes puis 4, échange 1 carte entre partenaires
- *  - Règles cartes principales + Joker, 7 décomposable (base)
+ * V4 – Bifurcation complète selon ta planche
+ *  - Tour = 48 cases (anneau principal)
+ *  - Sortie vers la GAUCHE (antihoraire)
+ *  - À +4 : fourche -> on peut rester sur l'anneau OU monter
+ *  - Montée = 4 cases (up1..up4) -> up4 = PORTAIL (sommet)
+ *  - Depuis un PORTAIL, au **tour suivant**, on peut se téléporter vers l'un des 3 autres portails
+ *  - Après un portail (téléporté ou non), la descente = 4 cases (down1..down4), puis on rejoint l'anneau au point +12
  *
- * À venir si tu veux (prochaine itération):
- *  - Traversée des écuries vides, couloirs d'arrivée complets et conditions de victoire sur "home"
- *  - Règles de fin avec le 7 (3 pions rentrés / dernier pion d'équipe) au millimètre
+ * Simplifications:
+ *  - Les couloirs d'écurie et conditions de victoire ne sont pas encore câblés (à ajouter ensuite)
+ *  - Traversée d'écuries vides: à venir
  */
 
 // ---------- Helpers de cartes ----------
@@ -49,59 +50,143 @@ function rankToValue(rank) {
 }
 
 // ---------- Plateau ----------
-const TRACK_LEN = 56; // 14 cases par quadrant
-const SECRET_PORTALS = [0, 14, 28, 42]; // pointes
+const TRACK_LEN = 48; // ✅ tour complet = 48 cases
 const COLORS = ["yellow", "red", "blue", "green"]; // joueurs 0..3, équipes (0,2) & (1,3)
 const DIRECTION = -1; // ➜ ANTihoraire: avancer = décrémenter les index
 
 // ✨ Ajuste ces 4 indices pour faire coïncider EXACTEMENT la case de sortie avec ta planche.
 // Astuce: passe la souris sur les ronds du plateau, le tooltip affiche "Case X".
-const START_INDEXES = [2, 16, 30, 44]; // Jaune, Rouge, Bleu, Vert (à ajuster visuellement)
+const START_INDEXES = [2, 14, 26, 38]; // Jaune, Rouge, Bleu, Vert (à ajuster visuellement)
 
-const PLAYER_CONF = COLORS.map((c, idx) => ({
-  color: c,
-  startIndex: START_INDEXES[idx],
-  portalTarget: (START_INDEXES[idx] + 48) % TRACK_LEN // ≈ "+8" antihoraire depuis la sortie
-}));
+// Indices dérivés pour chaque joueur
+function confForPlayer(idx) {
+  const s = START_INDEXES[idx];
+  return {
+    color: COLORS[idx],
+    startIndex: s,                        // case d'entrée
+    forkIndex: forward(s, 4),             // +4 = début de montée possible
+    portalIndex: null,                    // sommet est HORS anneau (up4)
+    rejoinIndex: forward(s, 12)           // +12 = retour sur anneau après descente
+  };
+}
+
+// Les 4 portails sommets: on les identifie par joueur (0..3)
+// Un portail est atteint après 4 cases de montée depuis forkIndex
+const PORTAL_IDS = [0, 1, 2, 3];
 
 const TEAM_OF = (p) => (p % 2 === 0 ? 0 : 1);
 
 function initialPawns() {
-  return Array.from({ length: 4 }, () => ({ location: "base", pieux: false, firstMove: true }));
+  return Array.from({ length: 4 }, () => ({ location: { kind: "base" }, pieux: false, firstMove: true }));
 }
 
 function clone(obj) { return JSON.parse(JSON.stringify(obj)); }
 
-// ---------- Déplacements avec sens antihoraire ----------
+// ---------- Déplacements avec sens antihoraire + bifurcation ----------
 function modTrack(x) { let v = x % TRACK_LEN; if (v < 0) v += TRACK_LEN; return v; }
 function forward(from, steps) { return modTrack(from + DIRECTION * steps); } // avance vers la GAUCHE
-function pathIndicesForward(from, steps) { const out = []; for (let i = 1; i <= steps; i++) out.push(forward(from, i)); return out; }
-function pathIndicesBackward(from, steps) { const out = []; for (let i = 1; i <= steps; i++) out.push(modTrack(from - DIRECTION * i)); return out; }
-function isSecretPortal(idx) { return SECRET_PORTALS.includes(idx); }
 
-// ---------- Outils d'occupation ----------
-function occupantAt(state, trackIndex) {
+// Convertit une position en un label unique pour l'occupation
+function posKey(pos) {
+  const k = pos.kind;
+  if (k === "track") return `T:${pos.idx}`;
+  if (k === "up" || k === "down") return `${k[0].toUpperCase()}:${pos.base}:${pos.step}`; // base = index joueur (0..3)
+  if (k === "portal") return `P:${pos.base}`; // base = index joueur (0..3)
+  return k; // base / home
+}
+
+// Vérifie si une case est occupée
+function occupantAt(state, targetKey) {
   for (let pi = 0; pi < 4; pi++) {
     const pl = state.players[pi];
     for (let pj = 0; pj < 4; pj++) {
       const p = pl.pawns[pj];
-      if (typeof p.location === "number" && p.location === trackIndex) return { owner: pi, pawnIdx: pj };
+      if (p.location && posKey(p.location) === targetKey) return { owner: pi, pawnIdx: pj };
     }
   }
   return null;
 }
 
-function isPathBlocked(state, targetRef, path) {
-  const last = path[path.length - 1];
+// Chemin pas-à-pas en tenant compte des fourches
+function computePathForward(state, playerIndex, startPos, steps) {
+  const path = []; // tableau de positions (sans la position de départ)
+  let cur = startPos;
+  const conf = confForPlayer(playerIndex);
+  for (let i = 0; i < steps; i++) {
+    // Avance d'1 étape
+    if (cur.kind === "track") {
+      const nextIdx = forward(cur.idx, 1);
+      // Si on arrive exactement sur la case fork, c'est juste une case de l'anneau.
+      // La montée n'est possible que si on CHOISIT une action spéciale (voir plus bas) –
+      // mais ici on reste sur l'anneau pour les déplacements "fwd" standard.
+      cur = { kind: "track", idx: nextIdx };
+    } else if (cur.kind === "up") {
+      if (cur.step < 4) cur = { kind: "up", base: cur.base, step: cur.step + 1 };
+      else cur = { kind: "portal", base: cur.base }; // up4 -> portail
+    } else if (cur.kind === "portal") {
+      // Pas d'avance depuis un portail sans téléportation -> on commence la descente au prochain mouvement
+      cur = { kind: "down", base: cur.base, step: 1 };
+    } else if (cur.kind === "down") {
+      if (cur.step < 4) cur = { kind: "down", base: cur.base, step: cur.step + 1 };
+      else {
+        // down4 -> retour sur l'anneau au rejoinIndex correspondant
+        const rejoin = confForPlayer(cur.base).rejoinIndex;
+        cur = { kind: "track", idx: rejoin };
+      }
+    } else {
+      // base/home ne devraient pas passer ici
+      return [];
+    }
+    path.push(cur);
+  }
+  return path;
+}
+
+// Spécifique: entrer dans la montée à partir de la case fork (doit commencer EXACTEMENT sur la fork)
+function computePathUpFromFork(playerIndex, steps) {
+  const base = playerIndex; // utilise l'index joueur pour identifier la branche
+  const path = [];
+  let cur = { kind: "up", base, step: 1 }; // premier cran de montée
+  for (let i = 1; i <= steps; i++) {
+    if (cur.kind === "up" && cur.step < 4) {
+      // avancer au prochain cran de montée
+      path.push({ ...cur });
+      cur = { kind: "up", base, step: cur.step + 1 };
+    } else if (cur.kind === "up" && cur.step === 4) {
+      // on arrive au portail
+      path.push({ kind: "portal", base });
+      cur = { kind: "portal", base };
+    } else if (cur.kind === "portal") {
+      // depuis le portail, avancer = début de descente
+      cur = { kind: "down", base, step: 1 };
+      path.push({ ...cur });
+    } else if (cur.kind === "down") {
+      if (cur.step < 4) {
+        cur = { kind: "down", base, step: cur.step + 1 };
+        path.push({ ...cur });
+      } else {
+        const rejoin = confForPlayer(base).rejoinIndex;
+        cur = { kind: "track", idx: rejoin };
+        path.push({ ...cur });
+      }
+    }
+  }
+  return path;
+}
+
+function isBlockedByOccupants(state, moverRef, path) {
+  // règle: pas de saut. Capture possible uniquement sur la DERNIÈRE case, si adverse et non pieux.
+  if (!path.length) return false;
+  const lastKey = posKey(path[path.length - 1]);
   for (let i = 0; i < path.length; i++) {
-    const idx = path[i];
-    const occ = occupantAt(state, idx);
-    const isLast = idx === last;
+    const k = posKey(path[i]);
+    const occ = occupantAt(state, k);
+    const isLast = k === lastKey;
     if (occ) {
-      if (!isLast) return true; // pas de saut
-      if (TEAM_OF(occ.owner) === TEAM_OF(targetRef.owner)) return true; // allié bloque la case finale
+      if (!isLast) return true;
+      if (TEAM_OF(occ.owner) === TEAM_OF(moverRef.owner)) return true;
       const pawn = state.players[occ.owner].pawns[occ.pawnIdx];
-      if (pawn.pieux) return true; // adverse pieux intouchable
+      if (pawn.pieux) return true;
     }
   }
   return false;
@@ -112,65 +197,81 @@ function legalMoves(state, playerIndex) {
   const moves = [];
   const player = state.players[playerIndex];
   const hand = player.hand;
+  const conf = confForPlayer(playerIndex);
 
   for (const card of hand) {
     const ranksToTry = card.joker ? ["A","2","3","4","5","6","7","8","9","10","J","Q","K"] : [card.rank];
     for (const rank of ranksToTry) {
+      // Valet (swap)
       if (rank === "J") {
-        // Valet: échanger deux pions (impact réel)
         const all = [];
-        state.players.forEach((pl, pi) => pl.pawns.forEach((pw, pj) => { if (typeof pw.location === "number") all.push({ owner: pi, idx: pj, loc: pw.location }); }));
-        for (let a = 0; a < all.length; a++) for (let b = a + 1; b < all.length; b++) if (all[a].loc !== all[b].loc)
+        state.players.forEach((pl, pi) => pl.pawns.forEach((pw, pj) => {
+          const k = pw.location.kind;
+          if (k !== "base" && k !== "home") all.push({ owner: pi, idx: pj, key: posKey(pw.location) });
+        }));
+        for (let a = 0; a < all.length; a++) for (let b = a + 1; b < all.length; b++) if (all[a].key !== all[b].key)
           moves.push({ type: "swap", cardId: card.id, usingRank: rank, A: all[a], B: all[b] });
         continue;
       }
 
+      // 5: avancer partenaire/adverse (pas soi) sur leur chemin actuel (anneau, up, portal->down)
       if (rank === "5") {
-        // 5: avancer partenaire ou adversaire (pas soi)
         state.players.forEach((pl, pi) => {
           if (pi === playerIndex) return;
           pl.pawns.forEach((pw, pj) => {
-            if (typeof pw.location === "number") {
-              const path = pathIndicesForward(pw.location, 5);
-              if (!isPathBlocked(state, { owner: pi, pawnIdx: pj }, path)) moves.push({ type: "move", cardId: card.id, usingRank: rank, target: { owner: pi, pawnIdx: pj }, steps: 5, dir: "fwd" });
-            }
+            if (pw.location.kind === "base" || pw.location.kind === "home") return;
+            const path = computePathForward(state, pi, pw.location, 5);
+            if (!isBlockedByOccupants(state, { owner: pi, pawnIdx: pj }, path))
+              moves.push({ type: "movePath", cardId: card.id, usingRank: rank, owner: pi, pawnIdx: pj, path });
           });
         });
         continue;
       }
 
+      // 4: reculer = avancer HORAIRE (on inverse la direction -> on simule avec 48-steps?)
       if (rank === "4") {
-        // 4: reculer (donc avancer horaire)
-        state.players[playerIndex].pawns.forEach((pw, pj) => {
-          if (typeof pw.location === "number") {
-            const path = pathIndicesBackward(pw.location, 4);
-            if (!isPathBlocked(state, { owner: playerIndex, pawnIdx: pj }, path)) moves.push({ type: "move", cardId: card.id, usingRank: rank, target: { owner: playerIndex, pawnIdx: pj }, steps: 4, dir: "back" });
+        player.pawns.forEach((pw, pj) => {
+          if (pw.location.kind === "track") {
+            // reculer de 4 sur l'anneau uniquement
+            const tmpStart = { kind: "track", idx: modTrack(pw.location.idx - DIRECTION * 0) };
+            const path = []; let cur = pw.location;
+            for (let i = 0; i < 4; i++) { cur = { kind: "track", idx: modTrack(cur.idx - DIRECTION * 1) }; path.push(cur); }
+            if (!isBlockedByOccupants(state, { owner: playerIndex, pawnIdx: pj }, path))
+              moves.push({ type: "movePath", cardId: card.id, usingRank: rank, owner: playerIndex, pawnIdx: pj, path });
           }
         });
         continue;
       }
 
+      // A/K: sortir OU avancer (A=1, K=13)
       if (rank === "A" || rank === "K") {
-        // Sortir OU avancer (A=1, K=13)
-        const canStart = player.pawns.some((p) => p.location === "base");
+        const canStart = player.pawns.some((p) => p.location.kind === "base");
         if (canStart) moves.push({ type: "start", cardId: card.id, usingRank: rank });
       }
 
-      // Avances classiques
+      // Avances classiques (y compris 7 split simplifié)
       if (["A","2","3","6","7","8","9","10","Q","K"].includes(rank)) {
         const steps = rank === "A" ? 1 : rank === "K" ? 13 : rankToValue(rank);
+
         if (rank === "7") {
-          // 7 décomposable (simple: proposer 7, 6+1, 5+2, 4+3 sur ses pions)
-          const splits = [[7],[6,1],[5,2],[4,3]];
+          const splits = [[7],[6,1],[5,2],[4,3]]; // sur ses propres pions uniquement
           for (const split of splits) {
             const options = enumerateSevenSplits(state, playerIndex, split);
-            moves.push(...options.map((ops) => ({ type: "seven", cardId: card.id, usingRank: rank, ops })));
+            moves.push(...options.map((pathOps) => ({ type: "sevenPaths", cardId: card.id, usingRank: rank, pathOps })));
           }
         } else {
-          state.players[playerIndex].pawns.forEach((pw, pj) => {
-            if (typeof pw.location === "number") {
-              const path = pathIndicesForward(pw.location, steps);
-              if (!isPathBlocked(state, { owner: playerIndex, pawnIdx: pj }, path)) moves.push({ type: "move", cardId: card.id, usingRank: rank, target: { owner: playerIndex, pawnIdx: pj }, steps, dir: "fwd" });
+          // Avancer selon la position actuelle
+          player.pawns.forEach((pw, pj) => {
+            if (pw.location.kind === "base" || pw.location.kind === "home") return;
+            let path = computePathForward(state, playerIndex, pw.location, steps);
+            if (!isBlockedByOccupants(state, { owner: playerIndex, pawnIdx: pj }, path))
+              moves.push({ type: "movePath", cardId: card.id, usingRank: rank, owner: playerIndex, pawnIdx: pj, path });
+
+            // Option spéciale: si on est EXACTEMENT sur la fork -> possibilité de MONTER
+            if (pw.location.kind === "track" && pw.location.idx === conf.forkIndex) {
+              const upPath = computePathUpFromFork(playerIndex, steps);
+              if (upPath.length && !isBlockedByOccupants(state, { owner: playerIndex, pawnIdx: pj }, upPath))
+                moves.push({ type: "movePath", cardId: card.id, usingRank: rank, owner: playerIndex, pawnIdx: pj, path: upPath, tag: "monte" });
             }
           });
         }
@@ -182,20 +283,28 @@ function legalMoves(state, playerIndex) {
 }
 
 function enumerateSevenSplits(state, playerIndex, split) {
-  const ops = [];
-  const my = [];
-  state.players[playerIndex].pawns.forEach((pw, pj) => { if (typeof pw.location === "number") my.push({ owner: playerIndex, pawnIdx: pj }); });
-  if (!my.length) return ops;
+  // Génère des séquences de chemins indépendantes (sur ses pions)
+  const myRefs = [];
+  state.players[playerIndex].pawns.forEach((pw, pj) => { if (pw.location.kind !== "base" && pw.location.kind !== "home") myRefs.push({ owner: playerIndex, pawnIdx: pj }); });
+  const results = [];
+
   function backtrack(i, acc) {
-    if (i === split.length) { ops.push(acc); return; }
-    for (const ref of my) {
-      const from = state.players[ref.owner].pawns[ref.pawnIdx].location;
-      const path = pathIndicesForward(from, split[i]);
-      if (!isPathBlocked(state, ref, path)) backtrack(i + 1, [...acc, { target: ref, steps: split[i], dir: "fwd" }]);
+    if (i === split.length) { results.push(acc); return; }
+    for (const ref of myRefs) {
+      const startPos = state.players[ref.owner].pawns[ref.pawnIdx].location;
+      const path = computePathForward(state, playerIndex, startPos, split[i]);
+      if (!isBlockedByOccupants(state, ref, path)) backtrack(i + 1, [...acc, { ref, path }]);
+
+      // depuis la fork, possibilité de montée
+      const conf = confForPlayer(playerIndex);
+      if (startPos.kind === "track" && startPos.idx === conf.forkIndex) {
+        const upPath = computePathUpFromFork(playerIndex, split[i]);
+        if (!isBlockedByOccupants(state, ref, upPath)) backtrack(i + 1, [...acc, { ref, path: upPath }]);
+      }
     }
   }
   backtrack(0, []);
-  return ops;
+  return results;
 }
 
 // ---------- Application des coups ----------
@@ -215,62 +324,64 @@ function applyMove(state, playerIndex, move) {
   }
 
   if (move.type === "start") {
-    const conf = PLAYER_CONF[playerIndex];
-    const entry = conf.startIndex;
-    const occ = occupantAt(S, entry);
+    const conf = confForPlayer(playerIndex);
+    const entryKey = posKey({ kind: "track", idx: conf.startIndex });
+    const occ = occupantAt(S, entryKey);
     if (occ) {
       if (TEAM_OF(occ.owner) !== TEAM_OF(playerIndex) && !S.players[occ.owner].pawns[occ.pawnIdx].pieux) {
-        S.players[occ.owner].pawns[occ.pawnIdx] = { location: "base", pieux: false, firstMove: true };
+        S.players[occ.owner].pawns[occ.pawnIdx] = { location: { kind: "base" }, pieux: false, firstMove: true };
       } else {
         S.log.push(entry(playerIndex, `Sortie impossible: case d'entrée bloquée.`));
         return S;
       }
     }
-    const pawnId = player.pawns.findIndex((p) => p.location === "base");
+    const pawnId = player.pawns.findIndex((p) => p.location.kind === "base");
     if (pawnId >= 0) {
-      player.pawns[pawnId] = { location: entry, pieux: true, firstMove: true };
+      player.pawns[pawnId] = { location: { kind: "track", idx: conf.startIndex }, pieux: true, firstMove: true };
       S.log.push(entry(playerIndex, `Sort un pion (pieux).`));
     }
     return S;
   }
 
-  if (move.type === "move") {
-    const { owner, pawnIdx, steps, dir } = move;
+  if (move.type === "movePath") {
+    const { owner, pawnIdx, path } = move;
     const pawn = S.players[owner].pawns[pawnIdx];
-    if (typeof pawn.location === "number") {
-      const dest = dir === "fwd" ? forward(pawn.location, steps) : pathIndicesBackward(pawn.location, steps).slice(-1)[0];
-      // capture finale si adverse
-      const occ = occupantAt(S, dest);
-      if (occ && TEAM_OF(occ.owner) !== TEAM_OF(owner)) {
-        const opPawn = S.players[occ.owner].pawns[occ.pawnIdx];
-        if (!opPawn.pieux) S.players[occ.owner].pawns[occ.pawnIdx] = { location: "base", pieux: false, firstMove: true };
-      }
-      pawn.location = dest;
-      pawn.pieux = false;
-      pawn.firstMove = false;
-      if (isSecretPortal(dest)) S.pendingPortal = { owner, pawnIdx, from: dest, choices: SECRET_PORTALS.filter((p) => p !== dest) };
-      S.log.push(entry(playerIndex, `Avance ${dir === "fwd" ? "+" : "-"}${steps}.`));
+    if (!path.length) return S;
+    const last = path[path.length - 1];
+    // capture sur la case finale si adverse
+    const occ = occupantAt(S, posKey(last));
+    if (occ && TEAM_OF(occ.owner) !== TEAM_OF(owner)) {
+      const opPawn = S.players[occ.owner].pawns[occ.pawnIdx];
+      if (!opPawn.pieux) S.players[occ.owner].pawns[occ.pawnIdx] = { location: { kind: "base" }, pieux: false, firstMove: true };
     }
+    pawn.location = last;
+    pawn.pieux = false;
+    pawn.firstMove = false;
+    // Si on s'arrête sur un portail, on pourra TELEPORTER au prochain tour
+    if (last.kind === "portal") {
+      const otherChoices = PORTAL_IDS.filter((p) => p !== last.base);
+      S.pendingPortal = { owner, pawnIdx, fromPortal: last.base, choices: otherChoices };
+    }
+    S.log.push(entry(playerIndex, `Avance (${move.usingRank})${move.tag === "monte" ? " en montée" : ""}.`));
     return S;
   }
 
-  if (move.type === "seven") {
-    for (const op of move.ops) {
-      const { owner, pawnIdx, steps } = op;
-      const pawn = S.players[owner].pawns[pawnIdx];
-      if (typeof pawn.location !== "number") continue;
-      const path = pathIndicesForward(pawn.location, steps);
-      if (isPathBlocked(S, { owner, pawnIdx }, path)) continue;
-      const dest = path[path.length - 1];
-      const occ = occupantAt(S, dest);
-      if (occ && TEAM_OF(occ.owner) !== TEAM_OF(owner)) {
+  if (move.type === "sevenPaths") {
+    for (const op of move.pathOps) {
+      const { ref, path } = op;
+      if (!path.length) continue;
+      const last = path[path.length - 1];
+      const occ = occupantAt(S, posKey(last));
+      if (occ && TEAM_OF(occ.owner) !== TEAM_OF(ref.owner)) {
         const opPawn = S.players[occ.owner].pawns[occ.pawnIdx];
-        if (!opPawn.pieux) S.players[occ.owner].pawns[occ.pawnIdx] = { location: "base", pieux: false, firstMove: true };
+        if (!opPawn.pieux) S.players[occ.owner].pawns[occ.pawnIdx] = { location: { kind: "base" }, pieux: false, firstMove: true };
       }
-      pawn.location = dest;
-      pawn.pieux = false;
-      pawn.firstMove = false;
-      if (isSecretPortal(dest)) S.pendingPortal = { owner, pawnIdx, from: dest, choices: SECRET_PORTALS.filter((p) => p !== dest) };
+      const pawn = S.players[ref.owner].pawns[ref.pawnIdx];
+      pawn.location = last; pawn.pieux = false; pawn.firstMove = false;
+      if (last.kind === "portal") {
+        const otherChoices = PORTAL_IDS.filter((p) => p !== last.base);
+        S.pendingPortal = { owner: ref.owner, pawnIdx: ref.pawnIdx, fromPortal: last.base, choices: otherChoices };
+      }
     }
     S.log.push(entry(playerIndex, `7 décomposé.`));
     return S;
@@ -285,7 +396,7 @@ function entry(playerIndex, text) { return { t: Date.now(), who: playerIndex, te
 function chooseBotMove(state, playerIndex) {
   const moves = legalMoves(state, playerIndex);
   if (!moves.length) return null;
-  const score = (m) => (m.type === "start" ? 90 : m.type === "move" ? (m.dir === "fwd" ? 70 : 50) : m.type === "seven" ? 75 : m.type === "swap" ? 40 : 10);
+  const score = (m) => (m.type === "start" ? 90 : m.type === "movePath" ? 70 : m.type === "sevenPaths" ? 75 : m.type === "swap" ? 40 : 10);
   return moves.reduce((best, m) => (score(m) > score(best) ? m : best), moves[0]);
 }
 
@@ -341,9 +452,7 @@ export default function App() {
     }
   }
 
-  function checkVictory(S) {
-    // TODO V4: compter les pions "home" quand on implémente les couloirs d'écurie
-  }
+  function checkVictory(S) { /* TODO couloirs d'écurie */ }
 
   function applyAndNext(move) { setState((prev) => { const S = applyMove(prev, prev.turn, move); checkVictory(S); if (!S.gameOver) nextTurnAfterPlay(S); return S; }); }
   function handleDiscardHand() { setState((prev) => { const S = clone(prev); const pl = S.players[S.turn]; S.discard.push(...pl.hand.splice(0)); S.log.push(entry(S.turn, "Jette sa main.")); nextTurnAfterPlay(S); return S; }); }
@@ -362,11 +471,14 @@ export default function App() {
       return S;
     });
   }
-  function usePortal(dest) {
+  function usePortal(destPortalId) {
     setState((prev) => {
-      const S = clone(prev); if (!S.pendingPortal) return S; const { owner, pawnIdx, choices } = S.pendingPortal; if (!choices.includes(dest)) return S;
-      const pawn = S.players[owner].pawns[pawnIdx]; pawn.location = dest; pawn.pieux = false; pawn.firstMove = false;
-      S.log.push(entry(state.turn, `Utilise un passage secret vers ${dest}.`)); S.pendingPortal = null; return S;
+      const S = clone(prev); if (!S.pendingPortal) return S; const { owner, pawnIdx, choices } = S.pendingPortal; if (!choices.includes(destPortalId)) return S;
+      // Téléporte vers un autre sommet
+      const pawn = S.players[owner].pawns[pawnIdx];
+      pawn.location = { kind: "portal", base: destPortalId };
+      pawn.pieux = false; pawn.firstMove = false;
+      S.log.push(entry(state.turn, `Téléportation vers portail ${destPortalId}.`)); S.pendingPortal = null; return S;
     });
   }
 
@@ -381,7 +493,7 @@ export default function App() {
               <div className="flex gap-2 items-center">
                 <span className="text-sm">Choisir passage :</span>
                 {state.pendingPortal.choices.map((c) => (
-                  <button key={c} className="px-3 py-1 rounded-2xl shadow bg-white" onClick={() => usePortal(c)}>{c}</button>
+                  <button key={c} className="px-3 py-1 rounded-2xl shadow bg-white" onClick={() => usePortal(c)}>Sommet {c}</button>
                 ))}
               </div>
             )}
@@ -444,30 +556,43 @@ export default function App() {
 function labelPlayer(i) { return ["J1 (Jaune)", "J2 (Rouge)", "J3 (Bleu)", "J4 (Vert)"][i]; }
 
 function Board({ state }) {
+  // Dessin: anneau = 48 points; on marque les forks (+4) et les sorties
   return (
     <div className="relative w-full aspect-square bg-gradient-to-br from-amber-100 to-amber-200 rounded-2xl">
-      {/* Cercle */}
       {[...Array(TRACK_LEN)].map((_, i) => {
-        const angle = (2 * Math.PI * i) / TRACK_LEN; // repère visuel (non lié au sens)
+        const angle = (2 * Math.PI * i) / TRACK_LEN; // repère visuel
         const r = 42; const cx = 50 + r * Math.cos(angle); const cy = 50 + r * Math.sin(angle);
-        const occ = occupantAt(state, i); const portal = isSecretPortal(i);
+        const occ = findOccTrack(state, i);
+        const isStart = START_INDEXES.includes(i);
+        const isFork = START_INDEXES.some((s) => modTrack(s + DIRECTION * 4) === i);
         return (
-          <div key={i} className={`absolute -translate-x-1/2 -translate-y-1/2 w-6 h-6 rounded-full border flex items-center justify-center text-[10px] ${portal ? "bg-purple-200 border-purple-600" : "bg-white border-neutral-400"}`} style={{ left: `${cx}%`, top: `${cy}%` }} title={`Case ${i}`}>
+          <div key={i} className={`absolute -translate-x-1/2 -translate-y-1/2 w-6 h-6 rounded-full border flex items-center justify-center text-[10px] ${isFork ? "bg-amber-300 border-amber-700" : isStart ? "bg-amber-200 border-amber-600" : "bg-white border-neutral-400"}`} style={{ left: `${cx}%`, top: `${cy}%` }} title={`Case ${i}`}>
             {occ && <PawnDot color={state.players[occ.owner].color} />}
           </div>
         );
       })}
-      {/* Cases de sortie */}
-      {PLAYER_CONF.map((conf, idx) => {
-        const angle = (2 * Math.PI * conf.startIndex) / TRACK_LEN; const r = 34; const cx = 50 + r * Math.cos(angle); const cy = 50 + r * Math.sin(angle);
+
+      {/* Portails (sommets) schématiques autour du cercle */}
+      {PORTAL_IDS.map((id) => {
+        const s = START_INDEXES[id];
+        const angle = (2 * Math.PI * modTrack(s + DIRECTION * 8)) / TRACK_LEN; // projeter visuellement le sommet
+        const r = 30; const cx = 50 + r * Math.cos(angle); const cy = 50 + r * Math.sin(angle);
+        const occ = findOccPortal(state, id);
         return (
-          <div key={idx} className="absolute -translate-x-1/2 -translate-y-1/2" style={{ left: `${cx}%`, top: `${cy}%` }}>
-            <div className="w-8 h-8 rounded-xl border-2 border-neutral-600 flex items-center justify-center" style={{ background: colorToken(COLORS[idx]) }}>S</div>
+          <div key={id} className="absolute -translate-x-1/2 -translate-y-1/2 w-6 h-6 rounded-full border bg-purple-200 border-purple-700 flex items-center justify-center text-[10px]" style={{ left: `${cx}%`, top: `${cy}%` }} title={`Sommet ${id}`}>
+            {occ && <PawnDot color={state.players[occ.owner].color} />}
           </div>
         );
       })}
     </div>
   );
+}
+
+function findOccTrack(state, idx) {
+  return occupantAt(state, posKey({ kind: "track", idx }));
+}
+function findOccPortal(state, base) {
+  return occupantAt(state, posKey({ kind: "portal", base }));
 }
 
 function PawnDot({ color }) { return <div className="w-3 h-3 rounded-full" style={{ background: colorToken(color) }} />; }
@@ -486,7 +611,7 @@ function TurnPanel({ state, moves, onPlay, onDiscard }) {
         <>
           <div className="text-sm mb-2">Coups légaux: {moves.length}</div>
           <div className="flex flex-wrap gap-2">
-            {moves.slice(0, 16).map((m, i) => (
+            {moves.slice(0, 18).map((m, i) => (
               <button key={i} onClick={() => onPlay(m)} className="px-2 py-1 rounded-xl bg-neutral-100 text-sm">{renderMoveLabel(m)}</button>
             ))}
           </div>
@@ -501,8 +626,8 @@ function TurnPanel({ state, moves, onPlay, onDiscard }) {
 
 function renderMoveLabel(m) {
   if (m.type === "start") return `Sortir (${m.usingRank})`;
-  if (m.type === "move") return `${m.usingRank} : ${m.dir === "fwd" ? "+" : "-"}${m.steps}`;
-  if (m.type === "seven") return `7 décomposé (${m.ops.map((o) => o.steps).join("+")})`;
+  if (m.type === "movePath") return `${m.usingRank}${m.tag === "monte" ? " (monter)" : ""}`;
+  if (m.type === "sevenPaths") return `7 décomposé`;
   if (m.type === "swap") return `Valet: échanger`;
   return "Coup";
 }
@@ -520,7 +645,7 @@ function HandPanel({ state, moves, onPlay, onDiscard }) {
         ))}
       </div>
       <div className="flex gap-2 flex-wrap">
-        {moves.slice(0, 18).map((m, i) => (
+        {moves.slice(0, 20).map((m, i) => (
           <button key={i} onClick={() => onPlay(m)} className="px-3 py-2 rounded-xl bg-neutral-100">{renderMoveLabel(m)}</button>
         ))}
         {moves.length === 0 && (
@@ -548,4 +673,3 @@ function ExchangePanel({ state, onChoose }) {
     </div>
   );
 }
-
