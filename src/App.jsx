@@ -3,15 +3,16 @@ import React, { useEffect, useMemo, useState } from "react";
 /**
  * Tok – prototype local (2v2) with optional bots
  * -------------------------------------------------
- * V2 – Sens de déplacement ANTihoraire (vers la gauche) après la sortie.
- * Choix manuel du passage secret à l'arrêt sur une pointe.
- * Échange d'une carte entre partenaires au début de chaque sous-manche.
- * Règles cartes principales + Joker.
+ * V3 – Sens de déplacement ANTihoraire (vers la gauche) après la sortie.
+ *  - 4 humains par défaut (bots désactivés, bouton pour activer au besoin)
+ *  - Choix manuel du passage secret quand on s'arrête sur une pointe
+ *  - Indices de sortie réglables pour coller à ta planche (START_INDEXES)
+ *  - Distribution: 5 cartes puis 4, échange 1 carte entre partenaires
+ *  - Règles cartes principales + Joker, 7 décomposable (base)
  *
- * ⚠️ À venir dans la V3 (pour tenir un MVP jouable rapidement) :
- *  - Entrées/sorties d'écuries détaillées + traversée des écuries vides (alliées/adverses)
- *  - Règles de fin avec le 7 (3 pions rentrés / dernier pion d'équipe)
- *  - Deux chemins (haut/bas) visuels après la sortie (bifurcation) – ici on permet déjà de viser le portail à +8
+ * À venir si tu veux (prochaine itération):
+ *  - Traversée des écuries vides, couloirs d'arrivée complets et conditions de victoire sur "home"
+ *  - Règles de fin avec le 7 (3 pions rentrés / dernier pion d'équipe) au millimètre
  */
 
 // ---------- Helpers de cartes ----------
@@ -53,10 +54,14 @@ const SECRET_PORTALS = [0, 14, 28, 42]; // pointes
 const COLORS = ["yellow", "red", "blue", "green"]; // joueurs 0..3, équipes (0,2) & (1,3)
 const DIRECTION = -1; // ➜ ANTihoraire: avancer = décrémenter les index
 
+// ✨ Ajuste ces 4 indices pour faire coïncider EXACTEMENT la case de sortie avec ta planche.
+// Astuce: passe la souris sur les ronds du plateau, le tooltip affiche "Case X".
+const START_INDEXES = [2, 16, 30, 44]; // Jaune, Rouge, Bleu, Vert (à ajuster visuellement)
+
 const PLAYER_CONF = COLORS.map((c, idx) => ({
   color: c,
-  startIndex: idx * 14,        // case d'entrée
-  portalTarget: (idx * 14 + 48) % TRACK_LEN, // ≈ "+8" antihoraire depuis la sortie
+  startIndex: START_INDEXES[idx],
+  portalTarget: (START_INDEXES[idx] + 48) % TRACK_LEN // ≈ "+8" antihoraire depuis la sortie
 }));
 
 const TEAM_OF = (p) => (p % 2 === 0 ? 0 : 1);
@@ -68,28 +73,10 @@ function initialPawns() {
 function clone(obj) { return JSON.parse(JSON.stringify(obj)); }
 
 // ---------- Déplacements avec sens antihoraire ----------
-function modTrack(x) {
-  let v = x % TRACK_LEN; if (v < 0) v += TRACK_LEN; return v;
-}
-
-function forward(from, steps) {
-  // Avance antihoraire: décrémente de `steps`
-  return modTrack(from + DIRECTION * steps);
-}
-
-function pathIndicesForward(from, steps) {
-  const out = [];
-  for (let i = 1; i <= steps; i++) out.push(forward(from, i));
-  return out;
-}
-
-function pathIndicesBackward(from, steps) {
-  // Recul antihoraire = avancer horaire = incrémenter
-  const out = [];
-  for (let i = 1; i <= steps; i++) out.push(modTrack(from - DIRECTION * i));
-  return out;
-}
-
+function modTrack(x) { let v = x % TRACK_LEN; if (v < 0) v += TRACK_LEN; return v; }
+function forward(from, steps) { return modTrack(from + DIRECTION * steps); } // avance vers la GAUCHE
+function pathIndicesForward(from, steps) { const out = []; for (let i = 1; i <= steps; i++) out.push(forward(from, i)); return out; }
+function pathIndicesBackward(from, steps) { const out = []; for (let i = 1; i <= steps; i++) out.push(modTrack(from - DIRECTION * i)); return out; }
 function isSecretPortal(idx) { return SECRET_PORTALS.includes(idx); }
 
 // ---------- Outils d'occupation ----------
@@ -130,7 +117,7 @@ function legalMoves(state, playerIndex) {
     const ranksToTry = card.joker ? ["A","2","3","4","5","6","7","8","9","10","J","Q","K"] : [card.rank];
     for (const rank of ranksToTry) {
       if (rank === "J") {
-        // Valet: échanger
+        // Valet: échanger deux pions (impact réel)
         const all = [];
         state.players.forEach((pl, pi) => pl.pawns.forEach((pw, pj) => { if (typeof pw.location === "number") all.push({ owner: pi, idx: pj, loc: pw.location }); }));
         for (let a = 0; a < all.length; a++) for (let b = a + 1; b < all.length; b++) if (all[a].loc !== all[b].loc)
@@ -303,10 +290,9 @@ function chooseBotMove(state, playerIndex) {
 }
 
 // ---------- Composant principal ----------
-export default function TokPrototype() {
+export default function App() {
   const [state, setState] = useState(() => newGame());
   const moves = useMemo(() => legalMoves(state, state.turn), [state]);
-  const current = state.players[state.turn];
 
   useEffect(() => {
     const pl = state.players[state.turn];
@@ -322,7 +308,14 @@ export default function TokPrototype() {
 
   function newGame() {
     const deck = buildDeck(true);
-    const players = COLORS.map((color, i) => ({ color, isBot: i === 1 || i === 3, pawns: initialPawns(), hand: [], exchangedWithPartner: false, mustDiscard: false }));
+    const players = COLORS.map((color, i) => ({
+      color,
+      isBot: false, // 4 humains par défaut
+      pawns: initialPawns(),
+      hand: [],
+      exchangedWithPartner: false,
+      mustDiscard: false
+    }));
     const S = { players, deck, discard: [], turn: 0, dealer: 0, exchangePhase: true, swappedCardBuffer: {}, pendingPortal: null, log: [], gameOver: false, roundDealCount: 0 };
     startRound(S);
     return S;
@@ -349,16 +342,12 @@ export default function TokPrototype() {
   }
 
   function checkVictory(S) {
-    // TODO V3: comptage réel des pions en "home" lorsque l'écurie sera implémentée
-    // Pour l'instant, pas de condition de fin réelle (MVP de mouvement/cartes)
+    // TODO V4: compter les pions "home" quand on implémente les couloirs d'écurie
   }
 
   function applyAndNext(move) { setState((prev) => { const S = applyMove(prev, prev.turn, move); checkVictory(S); if (!S.gameOver) nextTurnAfterPlay(S); return S; }); }
-
   function handleDiscardHand() { setState((prev) => { const S = clone(prev); const pl = S.players[S.turn]; S.discard.push(...pl.hand.splice(0)); S.log.push(entry(S.turn, "Jette sa main.")); nextTurnAfterPlay(S); return S; }); }
-
   function toggleBot(i) { setState((prev) => { const S = clone(prev); S.players[i].isBot = !S.players[i].isBot; return S; }); }
-
   function exchangeCard(i, cardId) {
     setState((prev) => {
       const S = clone(prev); if (!S.exchangePhase) return S; const partner = (i + 2) % 4;
@@ -373,7 +362,6 @@ export default function TokPrototype() {
       return S;
     });
   }
-
   function usePortal(dest) {
     setState((prev) => {
       const S = clone(prev); if (!S.pendingPortal) return S; const { owner, pawnIdx, choices } = S.pendingPortal; if (!choices.includes(dest)) return S;
@@ -458,6 +446,7 @@ function labelPlayer(i) { return ["J1 (Jaune)", "J2 (Rouge)", "J3 (Bleu)", "J4 (
 function Board({ state }) {
   return (
     <div className="relative w-full aspect-square bg-gradient-to-br from-amber-100 to-amber-200 rounded-2xl">
+      {/* Cercle */}
       {[...Array(TRACK_LEN)].map((_, i) => {
         const angle = (2 * Math.PI * i) / TRACK_LEN; // repère visuel (non lié au sens)
         const r = 42; const cx = 50 + r * Math.cos(angle); const cy = 50 + r * Math.sin(angle);
@@ -468,6 +457,7 @@ function Board({ state }) {
           </div>
         );
       })}
+      {/* Cases de sortie */}
       {PLAYER_CONF.map((conf, idx) => {
         const angle = (2 * Math.PI * conf.startIndex) / TRACK_LEN; const r = 34; const cx = 50 + r * Math.cos(angle); const cy = 50 + r * Math.sin(angle);
         return (
@@ -496,7 +486,7 @@ function TurnPanel({ state, moves, onPlay, onDiscard }) {
         <>
           <div className="text-sm mb-2">Coups légaux: {moves.length}</div>
           <div className="flex flex-wrap gap-2">
-            {moves.slice(0, 14).map((m, i) => (
+            {moves.slice(0, 16).map((m, i) => (
               <button key={i} onClick={() => onPlay(m)} className="px-2 py-1 rounded-xl bg-neutral-100 text-sm">{renderMoveLabel(m)}</button>
             ))}
           </div>
@@ -530,7 +520,7 @@ function HandPanel({ state, moves, onPlay, onDiscard }) {
         ))}
       </div>
       <div className="flex gap-2 flex-wrap">
-        {moves.slice(0, 16).map((m, i) => (
+        {moves.slice(0, 18).map((m, i) => (
           <button key={i} onClick={() => onPlay(m)} className="px-3 py-2 rounded-xl bg-neutral-100">{renderMoveLabel(m)}</button>
         ))}
         {moves.length === 0 && (
@@ -558,3 +548,4 @@ function ExchangePanel({ state, onChoose }) {
     </div>
   );
 }
+
